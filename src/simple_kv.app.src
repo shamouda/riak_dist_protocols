@@ -1,0 +1,7 @@
+%% -*- erlang -*-
+{application, simple_kv, [
+    {description, "A simple kv store"},
+    {vsn, "1.0.0"},
+    {applications, [ kernel, stdlib, riak_core ]},
+    {mod, {simple_kv_app, []}}
+]}.
