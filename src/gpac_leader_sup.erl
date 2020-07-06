@@ -26,37 +26,30 @@
 %% Description and complete License: see LICENSE file.
 %% -------------------------------------------------------------------
 
--module(simple_kv_app).
+-module(gpac_leader_sup).
 
--behaviour(application).
+-behavior(supervisor).
 
--export([start/2, stop/1]).
+-export([
+    start_fsm/0,
+    start_link/0
+]).
 
-%% ===================================================================
-%% Application callbacks
-%% ===================================================================
+-export([
+    init/1
+]).
 
-start(_StartType, _StartArgs) ->
-    ok = validate_data_dir(),
+start_link() ->
+    supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
-    case simple_kv_sup:start_link() of
-        {ok, Pid} ->
-            ok = riak_core:register([{vnode_module, sim2pc_cohort_vnode}]),
-            ok = riak_core:register([{vnode_module, gpac_cohort_vnode}]),
-            ok = riak_core_node_watcher:service_up(simple_kv_key_store, self()),
+%% Starts a new transaction coordinator under this supervisor
+start_fsm() ->
+    % calls gpac_leader:start_link()
+    supervisor:start_child(?MODULE, []).
 
-            {ok, Pid};
-        {error, Reason} ->
-            {error, Reason}
-    end.
-
-validate_data_dir() ->
-    DataDir = "data",
-    case filelib:ensure_dir(filename:join(DataDir, "dummy")) of
-        ok -> ok;
-        {error, Reason} ->
-            logger:critical("Data directory ~p does not exist, and could not be created: ~p", [DataDir, Reason]),
-            throw({error, invalid_data_dir})
-    end.
-
-stop(_State) -> ok.
+%% Starts the coordinator of a transaction.
+init([]) ->
+    Worker = {undefined,
+        {gpac_leader, start_link, []},
+        temporary, 5000, worker, [gpac_leader]},
+    {ok, {{simple_one_for_one, 5, 10}, [Worker]}}.

@@ -26,7 +26,7 @@
 %% Description and complete License: see LICENSE file.
 %% -------------------------------------------------------------------
 
--module(shard_utils).
+-module(sim2pc_shard_utils).
 
 %% start quorum constants
 -define(QUORUM_SIZE, 3).

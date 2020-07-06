@@ -46,11 +46,11 @@
 
 get(Bucket, Key) ->
     ReqId = make_ref(),
-    shard_utils:send_to_one_and_return_node(Bucket, Key, {get, ReqId, {Key}}).
+    sim2pc_shard_utils:send_to_one_and_return_node(Bucket, Key, {get, ReqId, {Key}}).
 
 put(Bucket, Key, Value) ->
     ReqId = make_ref(),
-    shard_utils:send_to_one_and_return_node(Bucket, Key, {put, ReqId, {Key, Value}}).
+    sim2pc_shard_utils:send_to_one_and_return_node(Bucket, Key, {put, ReqId, {Key, Value}}).
 
 keys() ->
     {ok, Ring} = riak_core_ring_manager:get_my_ring(),
@@ -63,8 +63,8 @@ keys() ->
 
 qget(Bucket, Key) ->
     ReqId = make_ref(),
-    shard_utils:send_to_quorum(Bucket, Key, {get, ReqId, {Key}}, ?R, ?TIMEOUT).
+    sim2pc_shard_utils:send_to_quorum(Bucket, Key, {get, ReqId, {Key}}, ?R, ?TIMEOUT).
 
 qput(Bucket, Key, Value) ->
     ReqId = make_ref(),
-    shard_utils:send_to_quorum(Bucket, Key, {put, ReqId, {Key, Value}}, ?W, ?TIMEOUT).
+    sim2pc_shard_utils:send_to_quorum(Bucket, Key, {put, ReqId, {Key, Value}}, ?W, ?TIMEOUT).

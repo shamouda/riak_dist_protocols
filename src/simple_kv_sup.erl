@@ -48,12 +48,21 @@ start_link() ->
 %% ===================================================================
 
 init(_Args) ->
-    LoggingMaster = {sim2pc_cohort_vnode_master,
+    Sim2PC_Cohort = {sim2pc_cohort_vnode_master,
                      {riak_core_vnode_master, start_link, [sim2pc_cohort_vnode]},
                      permanent, 5000, worker, [riak_core_vnode_master]},
     
-    Sim2PCSup = {sim2pc_coord_sup,
+    Sim2PC_Coord = {sim2pc_coord_sup,
                    {sim2pc_coord_sup, start_link, []},
                    permanent, 5000, supervisor, [sim2pc_coord_sup]},
+    
+    GPAC_Cohort = {gpac_cohort_vnode_master,
+                     {riak_core_vnode_master, start_link, [gpac_cohort_vnode]},
+                     permanent, 5000, worker, [riak_core_vnode_master]},
+    
+    GPAC_Coord = {gpac_leader_sup,
+                   {gpac_leader_sup, start_link, []},
+                   permanent, 5000, supervisor, [gpac_leader_sup]},
 
-    {ok, {{one_for_one, 5, 10}, [ LoggingMaster, Sim2PCSup ]}}.
+    {ok, {{one_for_one, 5, 10}, [ Sim2PC_Cohort, Sim2PC_Coord, 
+                                GPAC_Cohort, GPAC_Coord ]}}.

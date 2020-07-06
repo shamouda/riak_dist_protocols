@@ -26,7 +26,7 @@
 %% Description and complete License: see LICENSE file.
 %% -------------------------------------------------------------------
 
--module(sim2pc_coord).
+-module(gpac_leader).
 
 -behavior(gen_statem).
 
