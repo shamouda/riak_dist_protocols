@@ -38,7 +38,7 @@
 %%TODO: 1) make the statem remembers the visited nodes
 %%      2) 
 test() ->
-	{ok, Pid} = sim2pc_statem_sup:start_fsm(),
+	{ok, Pid} = sim2pc_coord_sup:start_fsm(),
 	TxId = 1,
 	Bucket = ?BUCKET,
 	io:format("Bucket = ~p\n", [Bucket]),

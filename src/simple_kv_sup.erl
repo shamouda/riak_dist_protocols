@@ -52,8 +52,8 @@ init(_Args) ->
                      {riak_core_vnode_master, start_link, [sim2pc_cohort_vnode]},
                      permanent, 5000, worker, [riak_core_vnode_master]},
     
-    Sim2PCSup = {sim2pc_statem_sup,
-                   {sim2pc_statem_sup, start_link, []},
-                   permanent, 5000, supervisor, [sim2pc_statem_sup]},
+    Sim2PCSup = {sim2pc_coord_sup,
+                   {sim2pc_coord_sup, start_link, []},
+                   permanent, 5000, supervisor, [sim2pc_coord_sup]},
 
     {ok, {{one_for_one, 5, 10}, [ LoggingMaster, Sim2PCSup ]}}.

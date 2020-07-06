@@ -26,7 +26,7 @@
 %% Description and complete License: see LICENSE file.
 %% -------------------------------------------------------------------
 
--module(sim2pc_statem).
+-module(sim2pc_coord).
 
 -behavior(gen_statem).
 

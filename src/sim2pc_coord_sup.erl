@@ -26,35 +26,30 @@
 %% Description and complete License: see LICENSE file.
 %% -------------------------------------------------------------------
 
--module(cc_test).
+-module(sim2pc_coord_sup).
 
-%% tests
+-behavior(supervisor).
+
 -export([
-    test/0
+    start_fsm/0,
+    start_link/0
 ]).
 
--define(BUCKET, test_utils:bucket(simple_kv_bucket)).
+-export([
+    init/1
+]).
 
-%%TODO: 1) make the statem remembers the visited nodes
-%%      2) 
-test() ->
-	{ok, Pid} = sim2pc_statem_sup:start_fsm(),
-	TxId = 1,
-	Bucket = ?BUCKET,
-	io:format("Bucket = ~p\n", [Bucket]),
-	Res1 = gen_statem:call(Pid, {start_tx, TxId}),
-	io:format("Res1 = ~p\n", [Res1]),
-	{ok, IndexNode1} = gen_statem:call(Pid, {tx_put, Bucket, key1, value1}),
-	{ok, IndexNode2} = gen_statem:call(Pid, {tx_put, Bucket, key2, value2}),
-	Nodes = [IndexNode1, IndexNode2],
-	io:format("Res2 = ~p\n", [Nodes]),
-	Res3 = gen_statem:call(Pid, {prepare, Nodes}),
-    io:format("Res3 = ~p\n", [Res3]),
-	Res4 = case Res3 of
-			ok -> gen_statem:call(Pid, {commit, Nodes});
-			abort -> gen_statem:call(Pid, {abort, Nodes})
-		end,
-    io:format("Res4 = ~p\n", [Res4]).
+start_link() ->
+    supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
+%% Starts a new transaction coordinator under this supervisor
+start_fsm() ->
+    % calls sim2pc_coord:start_link()
+    supervisor:start_child(?MODULE, []).
 
-
+%% Starts the coordinator of a transaction.
+init([]) ->
+    Worker = {undefined,
+        {sim2pc_coord, start_link, []},
+        temporary, 5000, worker, [sim2pc_coord]},
+    {ok, {{simple_one_for_one, 5, 10}, [Worker]}}.
