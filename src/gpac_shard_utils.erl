@@ -26,38 +26,20 @@
 %% Description and complete License: see LICENSE file.
 %% -------------------------------------------------------------------
 
--module(gpac_test).
+-module(gpac_shard_utils).
 
-%% tests
+%% start quorum constants
+-define(REPLICAS, 3).
+-define(QUORUM_SIZE, 3).
+-define(W, 2).
+-define(R, 1).
+-define(TIMEOUT, 1000). %% in millisecond
+%% end quorum constants
+
+%% API
 -export([
-    test/0
+    send_to_one/2
 ]).
 
-%%-define(BUCKET, test_utils:bucket(simple_kv_bucket)).
--define(BUCKET, simple_kv_bucket).
-
-%%TODO: 1) make the statem remembers the visited nodes
-%%      2) 
-test() ->
-	{ok, Pid} = gpac_leader_sup:start_fsm(),
-	TxId = 1,
-	Bucket = ?BUCKET,
-	io:format("Bucket = ~p\n", [Bucket]),
-	Res1 = gen_statem:call(Pid, {start_tx, TxId}),
-	io:format("Res1 = ~p\n", [Res1]),
-	{ok, IndexNode1} = gen_statem:call(Pid, {tx_put, Bucket, key1, value1}),
-	{ok, IndexNode2} = gen_statem:call(Pid, {tx_put, Bucket, key2, value2}),
-	{ok, IndexNode3, Value} = gen_statem:call(Pid, {tx_get, Bucket, key2}),
-	io:format("Value of key2 = ~p\n", [Value]),
-	Nodes = [IndexNode1, IndexNode2, IndexNode3],
-	io:format("Res2 = ~p\n", [Nodes]),
-	Res3 = gen_statem:call(Pid, {prepare, Nodes}),
-    io:format("Res3 = ~p\n", [Res3]),
-	Res4 = case Res3 of
-			ok -> gen_statem:call(Pid, {commit, Nodes});
-			abort -> gen_statem:call(Pid, {abort, Nodes})
-		end,
-    io:format("Res4 = ~p\n", [Res4]).
-
-
-
+send_to_one(IndexNode, Cmd) ->
+    riak_core_vnode_master:sync_spawn_command(IndexNode, Cmd, sim2pc_cohort_vnode_master).
