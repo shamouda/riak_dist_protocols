@@ -33,10 +33,9 @@
     test/0
 ]).
 
--define(BUCKET, test_utils:bucket(simple_kv_bucket)).
+%%-define(BUCKET, test_utils:bucket(simple_kv_bucket)).
+-define(BUCKET, simple_kv_bucket).
 
-%%TODO: 1) make the statem remembers the visited nodes
-%%      2) 
 test() ->
 	{ok, Pid} = sim2pc_coord_sup:start_fsm(),
 	TxId = 1,
