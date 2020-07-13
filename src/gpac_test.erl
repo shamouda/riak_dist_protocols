@@ -36,8 +36,6 @@
 %%-define(BUCKET, test_utils:bucket(simple_kv_bucket)).
 -define(BUCKET, simple_kv_bucket).
 
-%%TODO: 1) make the statem remembers the visited nodes
-%%      2) 
 test() ->
 	{ok, Pid} = gpac_leader_sup:start_fsm(),
 	TxId = 1,
@@ -45,19 +43,21 @@ test() ->
 	io:format("Bucket = ~p\n", [Bucket]),
 	Res1 = gen_statem:call(Pid, {start_tx, TxId}),
 	io:format("Res1 = ~p\n", [Res1]),
-	{ok, IndexNode1} = gen_statem:call(Pid, {tx_put, Bucket, key1, value1}),
-	{ok, IndexNode2} = gen_statem:call(Pid, {tx_put, Bucket, key2, value2}),
-	{ok, IndexNode3, Value} = gen_statem:call(Pid, {tx_get, Bucket, key2}),
-	io:format("Value of key2 = ~p\n", [Value]),
-	Nodes = [IndexNode1, IndexNode2, IndexNode3],
-	io:format("Res2 = ~p\n", [Nodes]),
-	Res3 = gen_statem:call(Pid, {prepare, Nodes}),
-    io:format("Res3 = ~p\n", [Res3]),
-	Res4 = case Res3 of
-			ok -> gen_statem:call(Pid, {commit, Nodes});
-			abort -> gen_statem:call(Pid, {abort, Nodes})
-		end,
-    io:format("Res4 = ~p\n", [Res4]).
+	{ok, PrefList1} = gen_statem:call(Pid, {tx_put, Bucket, key1, value1}),
+	{ok, PrefList2} = gen_statem:call(Pid, {tx_put, Bucket, key2, value2}),
+	{ok, PrefList3, Value} = gen_statem:call(Pid, {tx_get, Bucket, key2}),
+	
+	io:format("PrefList1 = ~p\n", [PrefList1]),
+	io:format("PrefList2 = ~p\n", [PrefList2]),
+	io:format("PrefList3 = ~p\n", [PrefList3]),
+	io:format("Value of key2 = ~p\n", [Value]).
+%%	Res3 = gen_statem:call(Pid, {elect_and_prepare}),
+%%    io:format("Res3 = ~p\n", [Res3]),
+%%	Res4 = case Res3 of
+%%			ok -> gen_statem:call(Pid, {commit});
+%%			abort -> gen_statem:call(Pid, {abort})
+%%		end,
+%%   io:format("Res4 = ~p\n", [Res4]).
 
 
 

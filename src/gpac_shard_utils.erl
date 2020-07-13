@@ -28,18 +28,57 @@
 
 -module(gpac_shard_utils).
 
-%% start quorum constants
--define(REPLICAS, 3).
--define(QUORUM_SIZE, 3).
--define(W, 2).
--define(R, 1).
--define(TIMEOUT, 1000). %% in millisecond
-%% end quorum constants
-
 %% API
 -export([
-    send_to_one/2
+    send_to_quorum_and_get_nodes/5,
+    send_to_quorum/3,
+    send_to_quorum_old/6
 ]).
 
-send_to_one(IndexNode, Cmd) ->
-    riak_core_vnode_master:sync_spawn_command(IndexNode, Cmd, sim2pc_cohort_vnode_master).
+send_to_quorum_and_get_nodes(Bucket, Key, Cmd, ReplicaCount, TimeOut) -> 
+    DocIdx = riak_core_util:chash_key({Bucket, Key}),
+    PrefList = riak_core_apl:get_primary_apl(DocIdx, ReplicaCount, simple_kv_key_store),
+    Responses = pmap(fun({IndexNode, _Type}) -> 
+                    riak_core_vnode_master:sync_command(IndexNode, Cmd, gpac_cohort_vnode_master, TimeOut) 
+                end, PrefList),
+    {PrefList, Responses}.
+
+send_to_quorum(Nodes, Cmd, TimeOut) ->
+    Responses = pmap(fun({IndexNode, _Type}) -> 
+                    riak_core_vnode_master:sync_command(IndexNode, Cmd, gpac_cohort_vnode_master, TimeOut) 
+                end, Nodes),
+    {Nodes, Responses}.
+ 
+ send_to_quorum_old(Bucket, Key, Cmd, ReplicaCount, QuorumSize, TimeOut) -> 
+    DocIdx = riak_core_util:chash_key({Bucket, Key}),
+    PrefList = riak_core_apl:get_primary_apl(DocIdx, ReplicaCount, simple_kv_key_store),
+    Responses = pmap(fun({IndexNode, _Type}) -> 
+                    riak_core_vnode_master:sync_command(IndexNode, Cmd, gpac_cohort_vnode_master, TimeOut) 
+                end, PrefList),
+
+    {ResponseCount, Results} = lists:foldl(fun(Response, {Count, TmpResults}) ->
+            case Response of
+                {{request_id, _ReqId}, _Result} -> {Count - 1, [TmpResults | Response]} ;
+                _ -> {Count, [TmpResults | Response]}
+            end
+        end, {QuorumSize, []}, Responses),
+
+    case ResponseCount =< 0 of
+        true -> {PrefList, Results};
+        _ -> error
+    end.
+%% -------------
+%% Utility function
+%% -------------
+pmap(F, L) ->
+     Parent = self(),
+     lists:foldl(
+         fun(X, N) ->
+             spawn_link(fun() ->
+                            Parent ! {pmap, N, F(X)}
+                        end),
+             N+1
+         end, 0, L),
+     L2 = [receive {pmap, N, R} -> {N, R} end || _ <- L],
+     {_, L3} = lists:unzip(lists:keysort(1, L2)),
+     L3.

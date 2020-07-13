@@ -32,6 +32,12 @@
 
 -include_lib("kernel/include/logger.hrl").
 
+%% start quorum constants
+-define(REPLICAS, 3).
+-define(QUORUM_SIZE, 2).
+-define(TIMEOUT, 1000). %% in millisecond
+%% end quorum constants
+
 
 %% API
 -export([
@@ -57,7 +63,7 @@
 
 -record(state, {
 	tx_id,
-	used_shards,  %% which shards used within the transaction
+	used_shards,  %% map from master shard -> replicas of master shard
 	status        %% transaction state : active | prepared | committing |
    				   %  committed | committed_read_only |
     			   %  undefined | aborted
@@ -83,7 +89,7 @@ callback_mode() ->
 
 init([]) ->
 	?LOG_INFO("State machine initialized next_state[ready_to_start]", []),
-    {ok, ready_to_start, #state{ used_shards = sets:new() }}.
+    {ok, ready_to_start, #state{ used_shards = maps:new() }}.
 
 format_status(_Opt, [_PDict, State, Data]) ->
     [{data, [{"State", {State, Data}}]}].
@@ -103,30 +109,46 @@ ready_to_start({call, Sender}, {start_tx, TxId}, State) ->
 
 waiting_for_op({call, Sender}, {tx_put, Bucket, Key, Value}, State = #state{tx_id = TxId, used_shards = OldShards}) ->
 	?LOG_INFO("current_state[waiting_for_op] action[tx_put, ~p, ~p]", [Key, Value]),
-    {IndexNode, _} = sim2pc_shard_utils:send_to_one_and_return_node(Bucket, Key, {tx_put, TxId, {Key, Value}}),
-    NewShards = sets:add_element(IndexNode, OldShards),
-    {next_state, waiting_for_op, State#state{used_shards= NewShards}, {reply, Sender, {ok, IndexNode}}};
+    {PrefList, Responses} = gpac_shard_utils:send_to_quorum_and_get_nodes(Bucket, Key, {tx_put, TxId, {Key, Value}}, ?REPLICAS, ?TIMEOUT),
+    ?LOG_INFO("===>current_state[waiting_for_op] PrefList[~p] Responses[~p]", [PrefList, Responses]),
+    %%validate_reponses(tx_put, Responses, ?QUORUM_SIZE),
+    [Master | Others] = PrefList,
+    NewShards = case maps:is_key(Master, OldShards) of
+        true -> OldShards;
+        false -> maps:put(Master, Others, OldShards)
+    end,
+    {next_state, waiting_for_op, State#state{used_shards= NewShards}, {reply, Sender, {ok, PrefList}}};
 
 waiting_for_op({call, Sender}, {tx_get, Bucket, Key}, State = #state{tx_id = TxId, used_shards = OldShards}) ->
 	?LOG_INFO("current_state[waiting_for_op] action[tx_get, ~p]", [Key]),
-    {IndexNode, Response} = sim2pc_shard_utils:send_to_one_and_return_node(Bucket, Key, {tx_get, TxId, {Key}}),
+    {PrefList, Responses} = gpac_shard_utils:send_to_quorum_and_get_nodes(Bucket, Key, {tx_get, TxId, {Key}}, ?REPLICAS, ?TIMEOUT),
+    ?LOG_INFO("===>current_state[waiting_for_op] PrefList[~p] Responses[~p]", [PrefList, Responses]),
+    %%validate_reponses(tx_put, Responses, ?QUORUM_SIZE),
+    [Master | Others] = PrefList,
+    NewShards = case maps:is_key(Master, OldShards) of
+        true -> OldShards;
+        false -> maps:put(Master, Others, OldShards)
+    end,
+    [Response | _] = Responses,
     {_, {value, Value}, _} = Response,
-    NewShards = sets:add_element(IndexNode, OldShards),
-    {next_state, waiting_for_op, State#state{used_shards= NewShards}, {reply, Sender, {ok, IndexNode, Value}}};
+    {next_state, waiting_for_op, State#state{used_shards= NewShards}, {reply, Sender, {ok, PrefList, Value}}};
 
-waiting_for_op({call, Sender}, {prepare}, State = #state{tx_id = TxId, used_shards = Shards}) ->
+waiting_for_op({call, Sender}, {elect_and_prepare}, State = #state{tx_id = TxId, used_shards = Shards}) ->
 	?LOG_INFO("current_state[waiting_for_op] action[prepare] shards[~p]", [Shards]),
-    Nodes = sets:to_list(Shards),
-    Response = lists:foldl(fun(Node, OutList) -> 
-                    Result = sim2pc_shard_utils:send_to_one(Node, {prepare, TxId}),
-                    [Result | OutList]
-                end, [], Nodes),
-    ?LOG_INFO("current_state[waiting_for_op] action[prepare] Response = ~p", [Response]),
-    ToAbort = lists:member(abort, Response),
+    MapEntries = maps:to_list(Shards),
+    Nodes = lists:foldl( fun({Master, Replicas}, InList) -> 
+        [InList | [Master | Replicas]]
+        end, [], MapEntries),
+    ?LOG_INFO("===>current_state[waiting_for_op] Nodes[~p]", [Nodes]),
+    {RepliedShards, Responses} = gpac_shard_utils:send_to_quorum(Nodes, {elect_and_prepare, TxId}, ?TIMEOUT),
+    ?LOG_INFO("===>current_state[waiting_for_op] PrefList[~p] Responses[~p]", [RepliedShards, Responses]),
+    %%%SuperSet = validate_reponses(elect_and_prepare, Responses, ?QUORUM_SIZE),
+    %%%?LOG_INFO("current_state[waiting_for_op] action[prepare] Responses = ~p", [Responses]),
+    ToAbort = lists:member(abort, Responses),
     case ToAbort of
-        false ->
+        true -> 
             {next_state, waiting_to_commit, State#state{status = waiting_to_commit}, {reply, Sender, ok}};
-        true ->
+        false -> 
             {next_state, waiting_to_abort, State#state{status = waiting_to_abort}, {reply, Sender, abort}}
     end.
 
@@ -141,6 +163,7 @@ waiting_to_abort({call, Sender}, {abort}, State = #state{tx_id = TxId, used_shar
     Nodes = sets:to_list(Shards),
     lists:foreach(fun(Node) -> sim2pc_shard_utils:send_to_one(Node, {abort, TxId}) end, Nodes),
     {next_state, aborted, State#state{status = aborted}, {reply, Sender, ok}}.
+
 
 %%%===================================================================
 %%% Internal functions

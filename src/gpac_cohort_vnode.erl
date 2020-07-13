@@ -87,7 +87,7 @@ handle_command({tx_put, ReqId, {Key, Value}}, _Sender, State = #state{kv_pending
     Location = [Partition, node()],
     logger:info("handle_command(tx_put) here=~p", [Location]),
     case sets:is_element(ReqId, Prepared) of
-        true -> {noreply, State};
+        true -> {reply, error, State};
         false -> append_pending_values(State, PendingState, ReqId, Key, Value, Partition)
     end;
 
@@ -95,11 +95,11 @@ handle_command({tx_get, ReqId, {Key}}, _Sender, State = #state{kv_pending = Pend
     Location = [Partition, node()],
     logger:info("handle_command(tx_get) here=~p", [Location]),
     case sets:is_element(ReqId, Prepared) of
-        true -> {noreply, State};
+        true -> {reply, error, State};
         false -> read_value(State, PendingState, KvState, ReqId, Key, Partition)
     end;
 
-handle_command({prepare, ReqId}, _Sender, State = #state{prepared = Prepared, partition = Partition}) ->
+handle_command({elect_and_prepare, ReqId}, _Sender, State = #state{prepared = Prepared, partition = Partition}) ->
     Location = [Partition, node()],
     logger:info("handle_command(prepare) here=~p", [Location]),
     AlreadyPrepared = sets:is_element(ReqId, Prepared),
@@ -152,8 +152,8 @@ read_value(State, PendingState, KvState, ReqId, Key, Partition) ->
     {reply, {{request_id, ReqId}, {value, Value}, {location, Location}}, State#state{kv_pending = NewPendingState}}.
 
 %% prepare an already prepared transaction
-prepare(_AlreadyPrepared = true, _ReqId, Location, State) ->
-    {reply, {ok, {location, Location}}, State};
+prepare(_AlreadyPrepared = true, ReqId, Location, State) ->
+    {reply, {{request_id, ReqId}, {location, Location}}, State};
 %% prepare a non-prepared transaction
 prepare(_AlreadyPrepared = false, ReqId, Location, State = #state{prepared = Prepared, kv_pending = PendingState}) ->
     case conflict_exist() of
@@ -162,12 +162,12 @@ prepare(_AlreadyPrepared = false, ReqId, Location, State = #state{prepared = Pre
             {reply, abort, State#state{kv_pending = NewPending}};
         false -> 
             NewPrep = sets:add_element(ReqId, Prepared),
-            {reply, {ok, {location, Location}}, State#state{prepared = NewPrep}}
+            {reply, {{request_id, ReqId}, {location, Location}}, State#state{prepared = NewPrep}}
     end.
 
 conflict_exist() ->
     %% TODO: implement the concurrency control
-    true.
+    false.
 %% -------------
 %% HANDOFF
 %% -------------
