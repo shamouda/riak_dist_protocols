@@ -53,6 +53,8 @@
 
 -ignore_xref([start_vnode/1]).
 
+%% TODO: gpac_cohort_vnode must record the latest accepted leader
+
 %assuming we handle just one request at a time
 -record(state, {
     partition, 
@@ -99,11 +101,11 @@ handle_command({tx_get, ReqId, {Key}}, _Sender, State = #state{kv_pending = Pend
         false -> read_value(State, PendingState, KvState, ReqId, Key, Partition)
     end;
 
-handle_command({elect_and_prepare, ReqId}, _Sender, State = #state{prepared = Prepared, partition = Partition}) ->
+handle_command({elect_and_prepare, ReqId, Master}, _Sender, State = #state{prepared = Prepared, partition = Partition}) ->
     Location = [Partition, node()],
     logger:info("handle_command(prepare) here=~p", [Location]),
     AlreadyPrepared = sets:is_element(ReqId, Prepared),
-    prepare(AlreadyPrepared, ReqId, Location, State);
+    prepare(AlreadyPrepared, ReqId, Location, State, Master);
 
 handle_command({commit, ReqId}, _Sender, State = #state{prepared = Prepared, kv_pending = PendingState, kv_state = KvState, partition = Partition}) ->
     Location = [Partition, node()],
@@ -152,17 +154,17 @@ read_value(State, PendingState, KvState, ReqId, Key, Partition) ->
     {reply, {{request_id, ReqId}, {value, Value}, {location, Location}}, State#state{kv_pending = NewPendingState}}.
 
 %% prepare an already prepared transaction
-prepare(_AlreadyPrepared = true, ReqId, Location, State) ->
-    {reply, {{request_id, ReqId}, {location, Location}}, State};
+prepare(_AlreadyPrepared = true, ReqId, Location, State, Master) ->
+    {reply, {{request_id, ReqId}, {location, Location}, {master, Master}}, State};
 %% prepare a non-prepared transaction
-prepare(_AlreadyPrepared = false, ReqId, Location, State = #state{prepared = Prepared, kv_pending = PendingState}) ->
+prepare(_AlreadyPrepared = false, ReqId, Location, State = #state{prepared = Prepared, kv_pending = PendingState}, Master) ->
     case conflict_exist() of
         true -> 
             NewPending = maps:remove(ReqId, PendingState),
             {reply, abort, State#state{kv_pending = NewPending}};
         false -> 
             NewPrep = sets:add_element(ReqId, Prepared),
-            {reply, {{request_id, ReqId}, {location, Location}}, State#state{prepared = NewPrep}}
+            {reply, {{request_id, ReqId}, {location, Location}, {master, Master}}, State#state{prepared = NewPrep}}
     end.
 
 conflict_exist() ->

@@ -26,6 +26,8 @@
 %% Description and complete License: see LICENSE file.
 %% -------------------------------------------------------------------
 
+%% TODO: leader must record its last sequence number
+
 -module(gpac_leader).
 
 -behavior(gen_statem).
@@ -115,12 +117,13 @@ waiting_for_op({call, Sender}, {tx_put, Bucket, Key, Value}, State = #state{tx_i
         false ->
             {next_state, waiting_to_abort, State#state{status = waiting_to_abort}, {reply, Sender, abort}};
         true ->
-            [Master | Others] = PrefList,
+            IndexNodes = [ IndexNode || {IndexNode, _Type} <- PrefList],
+            [Master | Others] = IndexNodes,
             NewShards = case maps:is_key(Master, OldShards) of
                             true -> OldShards;
                             false -> maps:put(Master, Others, OldShards)
                         end,
-            {next_state, waiting_for_op, State#state{used_shards= NewShards}, {reply, Sender, {ok, PrefList}}}
+            {next_state, waiting_for_op, State#state{used_shards= NewShards}, {reply, Sender, {ok, IndexNodes}}}
     end;
   
 waiting_for_op({call, Sender}, {tx_get, Bucket, Key}, State = #state{tx_id = TxId, used_shards = OldShards}) ->
@@ -131,12 +134,13 @@ waiting_for_op({call, Sender}, {tx_get, Bucket, Key}, State = #state{tx_id = TxI
         false ->
             {next_state, waiting_to_abort, State#state{status = waiting_to_abort}, {reply, Sender, abort}};
         true ->
-            [Master | Others] = PrefList,
+            IndexNodes = [ IndexNode || {IndexNode, _Type} <- PrefList],
+            [Master | Others] = IndexNodes,
             NewShards = case maps:is_key(Master, OldShards) of
                             true -> OldShards;
                             false -> maps:put(Master, Others, OldShards)
                         end,
-            {next_state, waiting_for_op, State#state{used_shards= NewShards}, {reply, Sender, {ok, PrefList, Value}}}
+            {next_state, waiting_for_op, State#state{used_shards= NewShards}, {reply, Sender, {ok, IndexNodes, Value}}}
     end;
 
 waiting_for_op({call, Sender}, {elect_and_prepare}, State = #state{tx_id = TxId, used_shards = Shards}) ->
@@ -146,12 +150,15 @@ waiting_for_op({call, Sender}, {elect_and_prepare}, State = #state{tx_id = TxId,
         [InList | [Master | Replicas]]
         end, [], MapEntries),
     ?LOG_INFO("===>current_state[waiting_for_op] Nodes[~p]", [Nodes]),
-    {RepliedShards, Responses} = gpac_shard_utils:send_to_quorum(Nodes, {elect_and_prepare, TxId}, ?TIMEOUT),
-    ?LOG_INFO("===>current_state[waiting_for_op] PrefList[~p] Responses[~p]", [RepliedShards, Responses]),
-    %%%SuperSet = validate_reponses(elect_and_prepare, Responses, ?QUORUM_SIZE),
-    %%%?LOG_INFO("current_state[waiting_for_op] action[prepare] Responses = ~p", [Responses]),
-    ToAbort = lists:member(abort, Responses),
-    case ToAbort of
+
+    Responses = lists:foldl(fun({Master, Replicas}, OutList) ->
+            Nodes = [Master | Replicas], 
+            {_RepliedShards, Responses} = gpac_shard_utils:send_to_quorum(Nodes, {elect_and_prepare, TxId, Master}, ?TIMEOUT),
+            [Responses | OutList]
+        end, [], MapEntries),
+
+    Success = validate_elect_and_prepare_responses(Responses, Shards),
+    case Success of
         true -> 
             {next_state, waiting_to_commit, State#state{status = waiting_to_commit}, {reply, Sender, ok}};
         false -> 
@@ -175,6 +182,7 @@ waiting_to_abort({call, Sender}, {abort}, State = #state{tx_id = TxId, used_shar
 %%% Internal functions
 %%%===================================================================
 
+validate_put_responses([], _) -> false;
 validate_put_responses(Responses, QuorumSize) ->
     ResponseCount = lists:foldl(fun(Response, Count) ->
         case Response of
@@ -199,3 +207,23 @@ validate_get_responses(Responses, QuorumSize) ->
     Success = ResponseCount =< 0,
     ?LOG_INFO("===>validate_get_responses Responses[~p] ExpectedValue[~p] Success[~p]", [Responses, ExpectedValue, Success]),
     {Success, ExpectedValue}.
+
+%% we need a superset response and no single abort
+validate_elect_and_prepare_responses(Responses, Shards) ->
+    MasterNodes = maps:keys(Shards),
+    TmpCountMap = lists:foldl(fun(Master, TmpMap) ->
+            maps:put(Master, 0, TmpMap)
+        end, maps:new(), MasterNodes),
+    CountMap = lists:foldl(fun(Response, TmpMap) ->
+        case Response of
+                {_ , {location, _IndexNode}, {master, Master}} -> 
+                    maps:put(Master, maps:get(Master, TmpMap) + 1, TmpMap);
+                _ -> TmpMap
+            end
+        end, TmpCountMap, Responses),
+    CountList = maps:to_list(CountMap),
+    ToAbort = lists:member(abort, Responses),
+    Result = lists:foldl(fun({_Master, Count}, Success) ->
+            Success and Count > ?REPLICAS / 2
+        end, ToAbort, CountList),
+    Result.
