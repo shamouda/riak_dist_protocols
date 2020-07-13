@@ -167,7 +167,7 @@ prepare(_AlreadyPrepared = false, ReqId, Location, State = #state{prepared = Pre
 
 conflict_exist() ->
     %% TODO: implement the concurrency control
-    true.
+    false.
 %% -------------
 %% HANDOFF
 %% -------------

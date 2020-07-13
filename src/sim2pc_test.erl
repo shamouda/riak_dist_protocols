@@ -49,12 +49,12 @@ test() ->
 	{ok, IndexNode3, Value} = gen_statem:call(Pid, {tx_get, Bucket, key2}),
 	io:format("Value of key2 = ~p\n", [Value]),
 	Nodes = [IndexNode1, IndexNode2, IndexNode3],
-	io:format("Res2 = ~p\n", [Nodes]),
-	Res3 = gen_statem:call(Pid, {prepare, Nodes}),
+	io:format("Shards = [~p]", [Nodes]),
+	Res3 = gen_statem:call(Pid, {prepare}),
     io:format("Res3 = ~p\n", [Res3]),
 	Res4 = case Res3 of
-			ok -> gen_statem:call(Pid, {commit, Nodes});
-			abort -> gen_statem:call(Pid, {abort, Nodes})
+			ok -> gen_statem:call(Pid, {commit});
+			abort -> gen_statem:call(Pid, {abort})
 		end,
     io:format("Res4 = ~p\n", [Res4]).
 

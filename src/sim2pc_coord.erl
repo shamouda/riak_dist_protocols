@@ -83,7 +83,7 @@ callback_mode() ->
 
 init([]) ->
 	?LOG_INFO("State machine initialized next_state[ready_to_start]", []),
-    {ok, ready_to_start, #state{}}.
+    {ok, ready_to_start, #state{ used_shards = sets:new() }}.
 
 format_status(_Opt, [_PDict, State, Data]) ->
     [{data, [{"State", {State, Data}}]}].
@@ -101,20 +101,22 @@ ready_to_start({call, Sender}, {start_tx, TxId}, State) ->
 	?LOG_INFO("current_state[ready_to_start] action[start_tx, ~p]", [TxId]),
     {next_state, waiting_for_op, State#state{tx_id = TxId, status = active}, {reply, Sender, ok}}.
 
-waiting_for_op({call, Sender}, {tx_put, Bucket, Key, Value}, State = #state{tx_id = TxId}) ->
+waiting_for_op({call, Sender}, {tx_put, Bucket, Key, Value}, State = #state{tx_id = TxId, used_shards = OldShards}) ->
 	?LOG_INFO("current_state[waiting_for_op] action[tx_put, ~p, ~p]", [Key, Value]),
     {IndexNode, _} = sim2pc_shard_utils:send_to_one_and_return_node(Bucket, Key, {tx_put, TxId, {Key, Value}}),
-    {next_state, waiting_for_op, State, {reply, Sender, {ok, IndexNode}}};
+    NewShards = sets:add_element(IndexNode, OldShards),
+    {next_state, waiting_for_op, State#state{used_shards= NewShards}, {reply, Sender, {ok, IndexNode}}};
 
-waiting_for_op({call, Sender}, {tx_get, Bucket, Key}, State = #state{tx_id = TxId}) ->
+waiting_for_op({call, Sender}, {tx_get, Bucket, Key}, State = #state{tx_id = TxId, used_shards = OldShards}) ->
 	?LOG_INFO("current_state[waiting_for_op] action[tx_get, ~p]", [Key]),
     {IndexNode, Response} = sim2pc_shard_utils:send_to_one_and_return_node(Bucket, Key, {tx_get, TxId, {Key}}),
     {_, {value, Value}, _} = Response,
-    {next_state, waiting_for_op, State, {reply, Sender, {ok, IndexNode, Value}}};
+    NewShards = sets:add_element(IndexNode, OldShards),
+    {next_state, waiting_for_op, State#state{used_shards= NewShards}, {reply, Sender, {ok, IndexNode, Value}}};
 
-waiting_for_op({call, Sender}, {prepare, NodesWithDuplicates}, State = #state{tx_id = TxId}) ->
-	?LOG_INFO("current_state[waiting_for_op] action[prepare]", []),
-    Nodes = lists:usort(NodesWithDuplicates), % to remove duplicates
+waiting_for_op({call, Sender}, {prepare}, State = #state{tx_id = TxId, used_shards = Shards}) ->
+	?LOG_INFO("current_state[waiting_for_op] action[prepare] shards[~p]", [Shards]),
+    Nodes = sets:to_list(Shards),
     Response = lists:foldl(fun(Node, OutList) -> 
                     Result = sim2pc_shard_utils:send_to_one(Node, {prepare, TxId}),
                     [Result | OutList]
@@ -128,15 +130,15 @@ waiting_for_op({call, Sender}, {prepare, NodesWithDuplicates}, State = #state{tx
             {next_state, waiting_to_abort, State#state{status = waiting_to_abort}, {reply, Sender, abort}}
     end.
 
-waiting_to_commit({call, Sender}, {commit, NodesWithDuplicates}, State = #state{tx_id = TxId}) ->
-	?LOG_INFO("current_state[waiting_to_commit] action[commit]", []),
-    Nodes = lists:usort(NodesWithDuplicates), % to remove duplicates
+waiting_to_commit({call, Sender}, {commit}, State = #state{tx_id = TxId, used_shards = Shards}) ->
+	?LOG_INFO("current_state[waiting_to_commit] action[commit] shards[~p]", [Shards]),
+    Nodes = sets:to_list(Shards),
     lists:foreach(fun(Node) -> sim2pc_shard_utils:send_to_one(Node, {commit, TxId}) end, Nodes),
     {next_state, committed, State#state{status = committed}, {reply, Sender, ok}}.
 
-waiting_to_abort({call, Sender}, {abort, NodesWithDuplicates}, State = #state{tx_id = TxId}) ->
-	?LOG_INFO("current_state[waiting_to_abort] action[abort]", []),
-    Nodes = lists:usort(NodesWithDuplicates), % to remove duplicates
+waiting_to_abort({call, Sender}, {abort}, State = #state{tx_id = TxId, used_shards = Shards}) ->
+	?LOG_INFO("current_state[waiting_to_abort] action[abort] shards[~p]", [Shards]),
+    Nodes = sets:to_list(Shards),
     lists:foreach(fun(Node) -> sim2pc_shard_utils:send_to_one(Node, {abort, TxId}) end, Nodes),
     {next_state, aborted, State#state{status = aborted}, {reply, Sender, ok}}.
 
