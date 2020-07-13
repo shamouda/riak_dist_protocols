@@ -110,28 +110,34 @@ ready_to_start({call, Sender}, {start_tx, TxId}, State) ->
 waiting_for_op({call, Sender}, {tx_put, Bucket, Key, Value}, State = #state{tx_id = TxId, used_shards = OldShards}) ->
 	?LOG_INFO("current_state[waiting_for_op] action[tx_put, ~p, ~p]", [Key, Value]),
     {PrefList, Responses} = gpac_shard_utils:send_to_quorum_and_get_nodes(Bucket, Key, {tx_put, TxId, {Key, Value}}, ?REPLICAS, ?TIMEOUT),
-    ?LOG_INFO("===>current_state[waiting_for_op] PrefList[~p] Responses[~p]", [PrefList, Responses]),
-    %%validate_reponses(tx_put, Responses, ?QUORUM_SIZE),
-    [Master | Others] = PrefList,
-    NewShards = case maps:is_key(Master, OldShards) of
-        true -> OldShards;
-        false -> maps:put(Master, Others, OldShards)
-    end,
-    {next_state, waiting_for_op, State#state{used_shards= NewShards}, {reply, Sender, {ok, PrefList}}};
-
+    Success = validate_put_responses(Responses, ?REPLICAS),
+    case Success of
+        false ->
+            {next_state, waiting_to_abort, State#state{status = waiting_to_abort}, {reply, Sender, abort}};
+        true ->
+            [Master | Others] = PrefList,
+            NewShards = case maps:is_key(Master, OldShards) of
+                            true -> OldShards;
+                            false -> maps:put(Master, Others, OldShards)
+                        end,
+            {next_state, waiting_for_op, State#state{used_shards= NewShards}, {reply, Sender, {ok, PrefList}}}
+    end;
+  
 waiting_for_op({call, Sender}, {tx_get, Bucket, Key}, State = #state{tx_id = TxId, used_shards = OldShards}) ->
 	?LOG_INFO("current_state[waiting_for_op] action[tx_get, ~p]", [Key]),
     {PrefList, Responses} = gpac_shard_utils:send_to_quorum_and_get_nodes(Bucket, Key, {tx_get, TxId, {Key}}, ?REPLICAS, ?TIMEOUT),
-    ?LOG_INFO("===>current_state[waiting_for_op] PrefList[~p] Responses[~p]", [PrefList, Responses]),
-    %%validate_reponses(tx_put, Responses, ?QUORUM_SIZE),
-    [Master | Others] = PrefList,
-    NewShards = case maps:is_key(Master, OldShards) of
-        true -> OldShards;
-        false -> maps:put(Master, Others, OldShards)
-    end,
-    [Response | _] = Responses,
-    {_, {value, Value}, _} = Response,
-    {next_state, waiting_for_op, State#state{used_shards= NewShards}, {reply, Sender, {ok, PrefList, Value}}};
+    {Success, Value} = validate_get_responses(Responses, ?REPLICAS),
+    case Success of
+        false ->
+            {next_state, waiting_to_abort, State#state{status = waiting_to_abort}, {reply, Sender, abort}};
+        true ->
+            [Master | Others] = PrefList,
+            NewShards = case maps:is_key(Master, OldShards) of
+                            true -> OldShards;
+                            false -> maps:put(Master, Others, OldShards)
+                        end,
+            {next_state, waiting_for_op, State#state{used_shards= NewShards}, {reply, Sender, {ok, PrefList, Value}}}
+    end;
 
 waiting_for_op({call, Sender}, {elect_and_prepare}, State = #state{tx_id = TxId, used_shards = Shards}) ->
 	?LOG_INFO("current_state[waiting_for_op] action[prepare] shards[~p]", [Shards]),
@@ -168,3 +174,28 @@ waiting_to_abort({call, Sender}, {abort}, State = #state{tx_id = TxId, used_shar
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
+
+validate_put_responses(Responses, QuorumSize) ->
+    ResponseCount = lists:foldl(fun(Response, Count) ->
+        case Response of
+                {{request_id, _ReqId}, _Result} -> Count - 1 ;
+                _ -> Count
+            end
+        end, QuorumSize, Responses),
+    Success = ResponseCount =< 0,
+    ?LOG_INFO("===>validate_put_responses Responses[~p] Success[~p]", [Responses, Success]),
+    Success.
+
+validate_get_responses([], _) -> {false, undefined};
+validate_get_responses(Responses, QuorumSize) ->
+    [ TmpResponse | _ ] = Responses,
+    {_, {value, ExpectedValue}, _} = TmpResponse,
+    ResponseCount = lists:foldl(fun(Response, Count) ->
+        case Response of
+                {_, {value, ExpectedValue} , _} -> Count - 1 ;
+                _ -> Count
+            end
+        end, QuorumSize, Responses),
+    Success = ResponseCount =< 0,
+    ?LOG_INFO("===>validate_get_responses Responses[~p] ExpectedValue[~p] Success[~p]", [Responses, ExpectedValue, Success]),
+    {Success, ExpectedValue}.
