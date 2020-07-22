@@ -65,12 +65,12 @@
 
 -record(state, {
 	tx_id,
-	used_shards,  %% map from master shard -> replicas of master shard
-	status        %% transaction state : active | prepared | committing |
+	used_shards,  %% map from [master shard] -> [other replicas of master shard]
+	status,       %% transaction state : active | prepared | committing |
    				   %  committed | committed_read_only |
     			   %  undefined | aborted
     			   %%
-    
+    finish_attempts  %% the allowed number of leader election failures
 }).
 
 %%%===================================================================
@@ -91,7 +91,7 @@ callback_mode() ->
 
 init([]) ->
 	?LOG_INFO("State machine initialized next_state[ready_to_start]", []),
-    {ok, ready_to_start, #state{ used_shards = maps:new() }}.
+    {ok, ready_to_start, #state{ used_shards = maps:new(), finish_attempts = 3 }}.
 
 format_status(_Opt, [_PDict, State, Data]) ->
     [{data, [{"State", {State, Data}}]}].
@@ -142,6 +142,14 @@ waiting_for_op({call, Sender}, {tx_get, Bucket, Key}, State = #state{tx_id = TxI
                         end,
             {next_state, waiting_for_op, State#state{used_shards= NewShards}, {reply, Sender, {ok, IndexNodes, Value}}}
     end;
+
+%The client will pick a leader to finish the transaction.
+%If leader election failed, another leader should be tried.
+waiting_for_op({call, Sender}, {end_transaction}, State = #state{tx_id = TxId, used_shards = Shards}) ->
+	?LOG_INFO("current_state[waiting_for_op] action[end_transaction] shards[~p]", [Shards]),
+    
+    {next_state, waiting_for_op, State#state{status = committed}, {reply, Sender, ok}};
+
 
 waiting_for_op({call, Sender}, {elect_and_prepare}, State = #state{tx_id = TxId, used_shards = Shards}) ->
 	?LOG_INFO("current_state[waiting_for_op] action[prepare] shards[~p]", [Shards]),
@@ -227,3 +235,25 @@ validate_elect_and_prepare_responses(Responses, Shards) ->
             Success and Count > ?REPLICAS / 2
         end, ToAbort, CountList),
     Result.
+
+
+
+
+repeat_election_till_success(Shards, I) ->
+	Pid2 = spawn(?MODULE, loop, []),
+	Pid2 ! {self(), start_election},
+	receive
+		{Pid2, success} -> io:format("Election Succeeded leader [~p]",[Pid2]);
+        timeout ->
+	end,
+	Pid2 ! stop.
+
+loop() ->
+	receive
+		{From, start_election} ->
+
+			From ! {self(), Msg},
+			loop();
+		stop ->
+			true
+	end.

@@ -54,13 +54,27 @@
 -ignore_xref([start_vnode/1]).
 
 %% TODO: gpac_cohort_vnode must record the latest accepted leader
+%% TODO: the state must be reset after each transaction (can we use a statem here?)
+%% TODO: remove the constants REPLICAS from here. Only set it in the leader module
+
+-define(REPLICAS, 3).
 
 %assuming we handle just one request at a time
 -record(state, {
     partition, 
     kv_state,  %stable k/v values (committed values)
     kv_pending, %non-committed changes  ReqId -> K/V Map 
-    prepared  %prepared transactions
+    prepared,  %prepared transactions
+    
+    %%% state variables for transaction commit %%%
+    ballot_num,
+    init_val,    % commit | abort | undefined
+    accept_num,
+    accept_val,
+    decision,
+
+    trying_to_lead,
+    responses % for the leader to process the responses
 }).
 
 -spec start_vnode(integer()) -> any().
@@ -71,7 +85,16 @@ init([Partition]) ->
     {ok, #state {  partition = Partition, 
                    kv_state = maps:new(), 
                    kv_pending = maps:new(), 
-                   prepared = sets:new() }}.
+                   prepared = sets:new(),
+                   
+                   ballot_num = {0, Partition},
+                   init_val = undefined,
+                   accept_num = {0, Partition},
+                   accept_val = null,
+                   decision = false,
+
+                   trying_to_lead = false
+                    }}.
 
 handle_command({get, ReqId, {Key}}, _Sender, State = #state{kv_state = KvState}) ->
     Value = maps:get(Key, KvState, not_assigned),
@@ -101,6 +124,74 @@ handle_command({tx_get, ReqId, {Key}}, _Sender, State = #state{kv_pending = Pend
         false -> read_value(State, PendingState, KvState, ReqId, Key, Partition)
     end;
 
+
+handle_command({end_transaction, ReqId, Shards, Timeout}, _Sender, State = #state{prepared = Prepared, partition = Partition, 
+    ballot_num = {Num, P}, 
+    init_value = InitValue, 
+    accept_num = AcceptNum, 
+    accept_val = AcceptValue, 
+    decision = Decision,
+    trying_to_lead = false}) ->
+
+    Location = [Partition, node()],
+    logger:info("handle_command(end_transaction) here=~p", [Location]),
+    NextBallot = {Num + 1, P},
+    NextInitValue = case conflict_exist() of
+        true -> abort;
+        false -> commit;
+    end,
+
+    MapEntries = maps:to_list(Shards),
+    ElectionResponse = lists:foldl(fun({Master, Replicas}, InMap) ->
+            Nodes = [Master | Replicas], 
+            {_RepliedShards, Responses} = gpac_shard_utils:send_to_quorum(Nodes, {pac_elect_me, ReqId, NextBallot, Master}, Timeout),
+            maps:put(Master, Responses, InMap),
+        end, #{}, MapEntries),
+    
+    %% flatten the responses to make the computations easier
+    TmpResponses = [ Responses || {Master, Responses} <- ElectionResponse],
+    FlatResponses = lists:flatten(TmpResponses),
+
+    ResponsesPerShard = count_valid_responses_per_shard(ElectionResponse),
+    N = lists:size(MapEntries),
+    R = ?REPLICAS,
+
+    SuperMajority = is_super_majority(ResponsesPerShard, N, R),
+    SuperSet = is_super_set(ResponsesPerShard, N, R),
+    OneDecisionTrue = find_any_decision_true(ResponsesPerShard),
+    OneAcceptedCommit = find_any_accepted_commit(ResponsesPerShard),
+    SuperSetVote = case SuperSet of
+        true -> get_super_set_vote(FlatResponses);
+        false -> undefined
+    end,
+    AcceptValueFound = case OneDecisionTrue of
+        true -> get_accepted_value_with_decision_true(FlatResponses);
+        false -> undefined,
+    end,
+
+    ElectionResult = process_electoin_response({SuperMajority, SuperSet, OneDecisionTrue, OneAcceptedCommit}, AcceptValueFound, SuperSetVote),
+    gpac_shard_utils:send_to_quorum(Nodes, {pac_elect_me, ReqId, NextBallot},Timeout),
+    {reply, {{request_id, ReqId}, {location, Location}}, State = #state{ballot_num = NextBallot, init_val = NextInitValue, trying_to_lead = true} };
+
+process_electoin_response(Status = {_SuperMajority, _SuperSet, _OneDecisionTrue, _OneAcceptedCommit}, AcceptValueFound, SuperSetVote) ->
+    case Status of 
+        {true, _, true, _} -> {{branch, 1}, {decision, true}, {accept_val, AcceptValueFound}};
+        {true, _, false, true} -> {{branch, 2}, {decision, true}, {accept_val, commit}}; %%TODO: is decision true here???
+        {true, true, _, _} -> {{branch, 3}, {accept_val, SuperSetVote}}; %%TODO: is decision true here???
+        {true, false, _, _} -> {{branch, 3}, {accept_val, abort}}; %%TODO: is decision true here???
+        _ -> error
+    end.
+
+handle_command({pac_elect_me, ReqId, Shards}, _Sender, State = #state{prepared = Prepared, partition = Partition}) ->
+    Location = [Partition, node()],
+    logger:info("handle_command(prepare) here=~p", [Location]),
+    {reply, {{request_id, ReqId}, {location, Location}}, State};
+
+handle_command({pac_elect_you, ReqId, Shards}, _Sender, State = #state{prepared = Prepared, partition = Partition}) ->
+    Location = [Partition, node()],
+    logger:info("handle_command(prepare) here=~p", [Location]),
+    {reply, {{request_id, ReqId}, {location, Location}}, State};
+
 handle_command({elect_and_prepare, ReqId, Master}, _Sender, State = #state{prepared = Prepared, partition = Partition}) ->
     Location = [Partition, node()],
     logger:info("handle_command(prepare) here=~p", [Location]),
@@ -123,11 +214,116 @@ handle_command({abort, ReqId}, _Sender, State = #state{prepared = Prepared, kv_p
     NewPendingState = maps:remove(ReqId, PendingState),
     {reply, {{request_id, ReqId}, {location, Location}}, State#state{kv_pending = NewPendingState, prepared = NewPrep}};
 
+
 handle_command(Message, _Sender, State) ->
     logger:warning("unhandled_command ~p", [Message]),
     {noreply, State}.
 
 %%%%%%% Utility functions %%%%%%%  
+%% count valid responses per shard
+%% returns a list of size N
+count_valid_responses_per_shard(ElectionResponse) ->
+    CountFun = fun({_Master, Responses}) ->
+        lists:foldl(fun(Response, Count) ->
+                    case Response of
+                        {{request_id, _ReqId}, _Result} -> Count + 1;
+                        _ -> Count
+                    end
+                end, 0, Responses)
+        end,
+    lists:map(CountFun, ElectionResponse).
+
+%% we must have a majority of replicas for EACH shard,
+%% that is why the filtered list must be of size N.
+%% N is the number of shards
+%% R is the number of replicas of a shard
+is_super_set(ResponsesPerShard, N, R) ->
+    FilterPred = fun(I) -> I > R / 2 end,
+    ShardsWithMajority = lists:filter(FilterPred, ResponsesPerShard),
+    lists:length(ShardsWithMajority) == N.
+
+%% we must have a majority of replicas for a majority of shards
+%% that is why the filtered list must be of size N.
+%% N is the number of shards
+%% R is the number of replicas of a shard
+is_super_majority(ResponsesPerShard, N, R) ->
+    FilterPred = fun(I) -> I > R / 2 end,
+    ShardsWithMajority = lists:filter(FilterPred, ResponsesPerShard),
+    lists:length(ShardsWithMajority) > N / 2.
+
+find_any_shard(ResponsePredicate, ElectionResponse) ->
+    FilterPred = fun({_Master, Responses}) -> 
+        Filtered = lists:filter(ResponsePredicate, Responses),
+        lists:length(Filtered) > 0
+    end,
+
+    MatchingList = lists:filter(FilterPred, ElectionResponse),
+    lists:length(MatchingList) > 0.
+
+find_any_decision_true(ElectionResponse) ->
+    DecisionTruePred = fun(Response) ->
+        case Response of
+            {{request_id, _ReqId}, {decision, true}, _Result} -> true;
+            _ -> false
+        end
+    end,
+
+    find_any_shard(DecisionTruePred, ElectionResponse).
+
+find_any_accepted_commit(ElectionResponse) ->
+    AcceptValCommitPred = fun(Response) ->
+        case Response of
+            {{request_id, _ReqId}, {accept_val, commit}, _Result} -> true;
+            _ -> false
+        end
+    end,
+
+    find_any_shard(AcceptValCommitPred, ElectionResponse).
+
+%%precondition: call this only if the responses are a super-set
+get_super_set_vote(FlatResponses) ->
+    %% check if everyone in the super-set voted to commit
+    AllCommit = lists:foldl(fun(Response, ValidFlag) ->
+        IsCommit = case Response of
+            {{request_id, _ReqId}, _Result1} -> 
+                case Response of
+                    {{request_id, _ReqId}, {init_val, commit}, _Result2} -> true;
+                    {{request_id, _ReqId}, {init_val, abort}, _Result3} -> false; %% todo: do we need this condition??!!
+                    _ -> false
+                end;
+            _ -> true %% ignore failed replicas in a super-set
+        end,
+        ValidFlag and IsCommit
+    end, true, FlatResponses),
+
+    case AllCommit of
+        true -> commit;
+        false -> abort
+    end.
+
+get_accepted_value_with_decision_true(FlatResponses) ->
+    list:fold(fun(Response, PrevValue) ->
+            case Response of 
+                {{request_id, _ReqId}, {decision, true}, {accept_val, Val}, _Result} -> true;
+                    case PrevValue of
+                        undefined -> Val;
+                        _ -> PrevValue
+                    end;
+                _ -> PrevValue
+            end
+        end, undefined, FlatResponses).
+
+%% check that we receive a majority from each shard
+validate_super_majority(ElectionResponse, MinLimit) ->
+    lists:foldl(fun({Master, Responses}, ValidResponse) ->
+            CorrectResponses = lists:foldl(fun(Response, Count) ->
+                    case Response of
+                        {{request_id, _ReqId}, _Result} -> Count + 1;
+                        _ -> Count
+                end, 0, Responses),
+            ValidResponse and CorrectResponses > MinLimit,
+        end, true, ElectionResponse).
+
 append_pending_values(State, PendingState, ReqId, Key, Value, Partition) ->
     Location = [Partition, node()],
     {WriteMap, ReadSet} = maps:get(ReqId, PendingState, {maps:new(), sets:new()}),

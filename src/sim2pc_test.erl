@@ -37,6 +37,7 @@
 -define(BUCKET, simple_kv_bucket).
 
 test() ->
+	io:format("************* Stating sim2pc test *************", []),
 	{ok, Pid} = sim2pc_coord_sup:start_fsm(),
 	TxId = 1,
 	Bucket = ?BUCKET,
