@@ -56,6 +56,8 @@
 %% TODO: gpac_cohort_vnode must record the latest accepted leader
 %% TODO: the state must be reset after each transaction (can we use a statem here?)
 %% TODO: remove the constants REPLICAS from here. Only set it in the leader module
+%% TODO: pac_elect_me must respond by pack_elect_you command. This will break down the committment to multiple phases and avoid blocking
+%% TODO: pac_apply must be sent asynchronously by leader
 
 -define(REPLICAS, 3).
 
@@ -73,8 +75,7 @@
     accept_val,
     decision,
 
-    trying_to_lead,
-    responses % for the leader to process the responses
+    promissed_ballot_num
 }).
 
 -spec start_vnode(integer()) -> any().
@@ -93,7 +94,7 @@ init([Partition]) ->
                    accept_val = null,
                    decision = false,
 
-                   trying_to_lead = false
+                   promissed_ballot_num = {-1, -1}
                     }}.
 
 handle_command({get, ReqId, {Key}}, _Sender, State = #state{kv_state = KvState}) ->
@@ -124,32 +125,32 @@ handle_command({tx_get, ReqId, {Key}}, _Sender, State = #state{kv_pending = Pend
         false -> read_value(State, PendingState, KvState, ReqId, Key, Partition)
     end;
 
-
+%% Here the partition tries to become the leader. 
+%% If successful, it proceeds into replicating the transaction's decision.
 handle_command({end_transaction, ReqId, Shards, Timeout}, _Sender, State = #state{prepared = Prepared, partition = Partition, 
     ballot_num = {Num, P}, 
-    init_value = InitValue, 
+    init_val = InitValue, 
     accept_num = AcceptNum, 
     accept_val = AcceptValue, 
-    decision = Decision,
-    trying_to_lead = false}) ->
+    decision = Decision}) ->
 
     Location = [Partition, node()],
     logger:info("handle_command(end_transaction) here=~p", [Location]),
-    NextBallot = {Num + 1, P},
-    NextInitValue = case conflict_exist() of
+    NewBallot = {Num + 1, P},
+    NewInitValue = case conflict_exist() of
         true -> abort;
-        false -> commit;
+        false -> commit
     end,
 
     MapEntries = maps:to_list(Shards),
     ElectionResponse = lists:foldl(fun({Master, Replicas}, InMap) ->
             Nodes = [Master | Replicas], 
-            {_RepliedShards, Responses} = gpac_shard_utils:send_to_quorum(Nodes, {pac_elect_me, ReqId, NextBallot, Master}, Timeout),
-            maps:put(Master, Responses, InMap),
+            {_RepliedShards, Responses} = gpac_shard_utils:send_to_quorum(Nodes, {pac_elect_me, ReqId, NewBallot}, Timeout),
+            maps:put(Master, Responses, InMap)
         end, #{}, MapEntries),
     
     %% flatten the responses to make the computations easier
-    TmpResponses = [ Responses || {Master, Responses} <- ElectionResponse],
+    TmpResponses = [ Responses || {_Master, Responses} <- ElectionResponse],
     FlatResponses = lists:flatten(TmpResponses),
 
     ResponsesPerShard = count_valid_responses_per_shard(ElectionResponse),
@@ -166,53 +167,103 @@ handle_command({end_transaction, ReqId, Shards, Timeout}, _Sender, State = #stat
     end,
     AcceptValueFound = case OneDecisionTrue of
         true -> get_accepted_value_with_decision_true(FlatResponses);
-        false -> undefined,
+        false -> undefined
     end,
 
-    ElectionResult = process_electoin_response({SuperMajority, SuperSet, OneDecisionTrue, OneAcceptedCommit}, AcceptValueFound, SuperSetVote),
-    gpac_shard_utils:send_to_quorum(Nodes, {pac_elect_me, ReqId, NextBallot},Timeout),
-    {reply, {{request_id, ReqId}, {location, Location}}, State = #state{ballot_num = NextBallot, init_val = NextInitValue, trying_to_lead = true} };
+    ElectionResult = process_election_response({SuperMajority, SuperSet, OneDecisionTrue, OneAcceptedCommit}, AcceptValueFound, SuperSetVote),
 
-process_electoin_response(Status = {_SuperMajority, _SuperSet, _OneDecisionTrue, _OneAcceptedCommit}, AcceptValueFound, SuperSetVote) ->
-    case Status of 
-        {true, _, true, _} -> {{branch, 1}, {decision, true}, {accept_val, AcceptValueFound}};
-        {true, _, false, true} -> {{branch, 2}, {decision, true}, {accept_val, commit}}; %%TODO: is decision true here???
-        {true, true, _, _} -> {{branch, 3}, {accept_val, SuperSetVote}}; %%TODO: is decision true here???
-        {true, false, _, _} -> {{branch, 3}, {accept_val, abort}}; %%TODO: is decision true here???
-        _ -> error
-    end.
+    %%TODO: handle the different cases
+    NewAcceptVal = AcceptValueFound,
+    NewAcceptNum = NewBallot,
+    AgreementResponse = lists:foldl(fun({Master, Replicas}, InMap) ->
+            Nodes = [Master | Replicas], 
+            {_RepliedShards, Responses} = gpac_shard_utils:send_to_quorum(Nodes, {pac_ft_agree, ReqId, NewAcceptVal, NewAcceptNum}, Timeout),
+            maps:put(Master, Responses, InMap)
+        end, #{}, MapEntries),
 
-handle_command({pac_elect_me, ReqId, Shards}, _Sender, State = #state{prepared = Prepared, partition = Partition}) ->
+    ResponsesPerShard2 = count_valid_responses_per_shard(AgreementResponse),
+    SuperMajority2 = is_super_majority(ResponsesPerShard2, N, R),
+
+    NewDecision = true, %%TODO: only when we hear back from a majority
+    %%TODO: no need to wait for responses
+    ElectionResponse = lists:foldl(fun({Master, Replicas}, InMap) ->
+        Nodes = [Master | Replicas], 
+        {_RepliedShards, Responses} = gpac_shard_utils:send_to_quorum(Nodes, {pac_apply, ReqId, NewDecision, NewAcceptVal}, Timeout),
+        maps:put(Master, Responses, InMap)
+    end, #{}, MapEntries),
+
+    {reply, {{request_id, ReqId}, {location, Location}}, State = #state{ballot_num = NewBallot, 
+                                                                        init_val = NewInitValue,
+                                                                        accept_val = NewAcceptVal,
+                                                                        accept_num = NewAcceptNum,
+                                                                        decision = NewDecision
+                                                                        } };
+
+%%process_election_response(Status = {_SuperMajority, _SuperSet, _OneDecisionTrue, _OneAcceptedCommit}, AcceptValueFound, SuperSetVote) ->
+%%    case Status of 
+%%        {true, _, true, _} -> {{branch, 1}, {decision, true}, {accept_val, AcceptValueFound}};
+%%        {true, _, false, true} -> {{branch, 2}, {decision, true}, {accept_val, commit}}; %%TODO: is decision true here???
+%%        {true, true, _, _} -> {{branch, 3}, {accept_val, SuperSetVote}}; %%TODO: is decision true here???
+%%        {true, false, _, _} -> {{branch, 3}, {accept_val, abort}}; %%TODO: is decision true here???
+%%       _ -> error
+%%    end.
+
+%% TODO: should better respond by invoking the pac_elect_you command to the leader, but this requires detecting timeouts by the leader
+handle_command({pac_elect_me, ReqId, ProposedBallot}, _Sender, State = #state{partition = Partition,
+    promissed_ballot_num = PromissedBallot,
+    accept_num = AcceptNum, 
+    accept_val = AcceptValue,
+    decision = Decision}) ->
     Location = [Partition, node()],
-    logger:info("handle_command(prepare) here=~p", [Location]),
-    {reply, {{request_id, ReqId}, {location, Location}}, State};
+    logger:info("handle_command(pac_elect_me) here=~p", [Location]),
+    {N1, P1} = ProposedBallot,
+    {N2, P2} = PromissedBallot,
+    AcceptCondition = is_greater_ballot(ProposedBallot, PromissedBallot), %%true, %%(P1 == P2 and N2 > N1) or (P2 > P1),
 
-handle_command({pac_elect_you, ReqId, Shards}, _Sender, State = #state{prepared = Prepared, partition = Partition}) ->
-    Location = [Partition, node()],
-    logger:info("handle_command(prepare) here=~p", [Location]),
-    {reply, {{request_id, ReqId}, {location, Location}}, State};
+    NextInitValue = case conflict_exist() of
+        true -> abort;
+        false -> commit
+    end,
 
-handle_command({elect_and_prepare, ReqId, Master}, _Sender, State = #state{prepared = Prepared, partition = Partition}) ->
-    Location = [Partition, node()],
-    logger:info("handle_command(prepare) here=~p", [Location]),
-    AlreadyPrepared = sets:is_element(ReqId, Prepared),
-    prepare(AlreadyPrepared, ReqId, Location, State, Master);
+    case AcceptCondition of
+        true -> {reply, {{request_id, ReqId}, 
+                         {location, Location}, 
+                         {init_val, NextInitValue}, 
+                         {accept_val, AcceptValue}, 
+                         {accept_num, AcceptNum}, 
+                         {decision, Decision}}, 
+                    State = #state{promissed_ballot_num = ProposedBallot, init_val = NextInitValue}};
+        false -> {noreply, State}
+    end;
 
-handle_command({commit, ReqId}, _Sender, State = #state{prepared = Prepared, kv_pending = PendingState, kv_state = KvState, partition = Partition}) ->
+%% TODO: should better response by invoking command pack-ft-agreed
+handle_command({pac_ft_agree, ReqId, AcceptVal, AcceptNum}, _Sender, State = #state{partition = Partition,
+    promissed_ballot_num = PromissedBallot}) ->
     Location = [Partition, node()],
-    logger:info("handle_command(commit) here=~p", [Location]),
-    NewPrep = sets:del_element(ReqId, Prepared),
-    {WriteMap, _ReadSet} = maps:get(ReqId, PendingState),
-    NewKvState = maps:fold(fun(K, V, Accum) -> maps:put(K, V, Accum) end, KvState, WriteMap),
-    NewPendingState = maps:remove(ReqId, PendingState),
-    {reply, {{request_id, ReqId}, {location, Location}}, State#state{kv_pending = NewPendingState, kv_state = NewKvState, prepared = NewPrep}};
+    logger:info("handle_command(pac_ft_agree) here=~p", [Location]),
+    AcceptCondition =  is_greater_or_equal_ballot(AcceptNum, PromissedBallot),
+    case AcceptCondition of
+        true -> {reply, {{request_id, ReqId}, 
+                         {location, Location}}, 
+                    State = #state{accept_val = AcceptVal, accept_num = AcceptNum}};
+        false -> {noreply, State}
+    end;
 
-handle_command({abort, ReqId}, _Sender, State = #state{prepared = Prepared, kv_pending = PendingState, partition = Partition}) ->
+handle_command({pac_apply, _ReqId, Decision, AcceptVal}, _Sender, State = #state{partition = Partition,
+    promissed_ballot_num = PromissedBallot}) ->
     Location = [Partition, node()],
-    logger:info("handle_command(abort) here=~p", [Location]),
-    NewPrep = sets:del_element(ReqId, Prepared),
-    NewPendingState = maps:remove(ReqId, PendingState),
-    {reply, {{request_id, ReqId}, {location, Location}}, State#state{kv_pending = NewPendingState, prepared = NewPrep}};
+    logger:info("handle_command(pac_apply) here=~p", [Location]),
+    case AcceptVal of
+        commit -> perform_commit();
+        abort -> perform_abort()
+    end,
+    {noreply, State = #state{decision = Decision, accept_val = AcceptVal}};
+
+%% TODO: implementing separate command pac_elect_you leads to more efficient and reliable execution
+%%handle_command({pac_elect_you, ReqId, Shards}, _Sender, State = #state{prepared = Prepared, partition = Partition}) ->
+%%    Location = [Partition, node()],
+%%    logger:info("handle_command(prepare) here=~p", [Location]),
+%%    {reply, {{request_id, ReqId}, {location, Location}}, State};
 
 
 handle_command(Message, _Sender, State) ->
@@ -220,6 +271,9 @@ handle_command(Message, _Sender, State) ->
     {noreply, State}.
 
 %%%%%%% Utility functions %%%%%%%  
+perform_commit() -> ok.
+perform_abort() -> ok.
+
 %% count valid responses per shard
 %% returns a list of size N
 count_valid_responses_per_shard(ElectionResponse) ->
@@ -313,59 +367,22 @@ get_accepted_value_with_decision_true(FlatResponses) ->
             end
         end, undefined, FlatResponses).
 
-%% check that we receive a majority from each shard
-validate_super_majority(ElectionResponse, MinLimit) ->
-    lists:foldl(fun({Master, Responses}, ValidResponse) ->
-            CorrectResponses = lists:foldl(fun(Response, Count) ->
-                    case Response of
-                        {{request_id, _ReqId}, _Result} -> Count + 1;
-                        _ -> Count
-                end, 0, Responses),
-            ValidResponse and CorrectResponses > MinLimit,
-        end, true, ElectionResponse).
-
-append_pending_values(State, PendingState, ReqId, Key, Value, Partition) ->
-    Location = [Partition, node()],
-    {WriteMap, ReadSet} = maps:get(ReqId, PendingState, {maps:new(), sets:new()}),
-    WriteMapAfter = maps:put(Key, Value, WriteMap),
-    ReadSetAfter = case sets:is_element(Key, ReadSet) of
-        true -> sets:del_element(Key, ReadSet);
-        false -> ReadSet
-    end,
-    NewPendingState = maps:put(ReqId, {WriteMapAfter, ReadSetAfter}, PendingState),
-    {reply, {{request_id, ReqId}, {location, Location}}, State#state{kv_pending = NewPendingState}}.
-
-read_value(State, PendingState, KvState, ReqId, Key, Partition) ->
-    Location = [Partition, node()],
-    {WriteMap, ReadSet} = maps:get(ReqId, PendingState, {maps:new(), sets:new()}),
-    Value = case maps:is_key(Key, WriteMap) of
-        true -> maps:get(Key, WriteMap);
-        false -> maps:get(Key, KvState, not_assigned)
-    end,
-    ReadSetAfter = case sets:is_element(Key, ReadSet) of
-        true -> ReadSet;
-        false -> sets:add_element(Key, ReadSet)
-    end,
-    NewPendingState = maps:put(ReqId, {WriteMap, ReadSetAfter}, PendingState),
-    {reply, {{request_id, ReqId}, {value, Value}, {location, Location}}, State#state{kv_pending = NewPendingState}}.
-
-%% prepare an already prepared transaction
-prepare(_AlreadyPrepared = true, ReqId, Location, State, Master) ->
-    {reply, {{request_id, ReqId}, {location, Location}, {master, Master}}, State};
-%% prepare a non-prepared transaction
-prepare(_AlreadyPrepared = false, ReqId, Location, State = #state{prepared = Prepared, kv_pending = PendingState}, Master) ->
-    case conflict_exist() of
-        true -> 
-            NewPending = maps:remove(ReqId, PendingState),
-            {reply, abort, State#state{kv_pending = NewPending}};
-        false -> 
-            NewPrep = sets:add_element(ReqId, Prepared),
-            {reply, {{request_id, ReqId}, {location, Location}, {master, Master}}, State#state{prepared = NewPrep}}
+process_election_response(Status = {_SuperMajority, _SuperSet, _OneDecisionTrue, _OneAcceptedCommit}, AcceptValueFound, SuperSetVote) ->
+    case Status of 
+        {true, _, true, _} -> {{branch, 1}, {decision, true}, {accept_val, AcceptValueFound}};
+        {true, _, false, true} -> {{branch, 2}, {decision, true}, {accept_val, commit}}; %%TODO: is decision true here???
+        {true, true, _, _} -> {{branch, 3}, {accept_val, SuperSetVote}}; %%TODO: is decision true here???
+        {true, false, _, _} -> {{branch, 3}, {accept_val, abort}}; %%TODO: is decision true here???
+        _ -> error
     end.
 
 conflict_exist() ->
     %% TODO: implement the concurrency control
     false.
+
+is_greater_ballot({_N1, _P1}, {_N2, _P2}) -> true.
+is_greater_or_equal_ballot({_N1, _P1}, {_N2, _P2}) -> true.
+
 %% -------------
 %% HANDOFF
 %% -------------
